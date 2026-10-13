@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Promise Minimap Mover 1.1.2
+Promise Minimap Mover 1.1.8
 
 Controls:
     Ctrl + click on minimap
@@ -33,7 +33,7 @@ from gui.Scaleform.daapi.view.battle.shared.minimap.component import (
 # Mod information
 # ===========================================================================
 
-__version__ = '1.1.2'
+__version__ = '1.1.9'
 MOD_VERSION = __version__
 MOD_NAME = 'MinimapMover'
 
@@ -51,6 +51,7 @@ def log(message):
 POLL_INTERVAL = 0.02
 DRAG_THRESHOLD = 5.0
 REFRESH_DELAY = 0.05
+SIZE_WATCH_INTERVAL = 0.5
 
 
 # ===========================================================================
@@ -66,6 +67,8 @@ _base_y = None
 _base_locked = False
 
 _saved_size = None      # from cfg
+_size_watch_callback = None
+_size_watch_ready = False
 _battle_size = None     # frozen once per battle before any as_setSize
 
 _poll_callback = None
@@ -83,6 +86,11 @@ _last_y = None
 _installed = False
 _original_populate = None
 _original_dispose = None
+_size_hook_class = None
+_size_hook_original = None
+_size_hook_attempted = False
+_internal_size_call = False
+_last_user_resize_key_time = -1000.0
 
 
 # ===========================================================================
@@ -169,6 +177,7 @@ def load_offset():
 
 
 def save_offset():
+    global _saved_size
     path = _get_config_path()
     if not path:
         return
@@ -179,6 +188,7 @@ def save_offset():
     if size is None:
         size = read_minimap_size_from_settings()
 
+    _saved_size = int(size)
     folder = os.path.dirname(path)
     try:
         if not os.path.isdir(folder):
@@ -467,13 +477,143 @@ def write_minimap_size_to_settings(index):
     return False
 
 
+# Class-level hooks on the concrete ClassicMinimapComponent (diagnostic only).
+# Do not hook PyGFxDisplayObject: it does not expose as_setSize.
+_size_hook_originals = {}
+_size_hook_wrappers = {}
+
+
+def record_user_minimap_size(index):
+    global _battle_size
+    _battle_size = int(index)
+    save_offset()
+    log('USER SIZE SAVED index=%s' % index)
+
+
+def install_size_diagnostic_hook():
+    global _size_hook_class
+    if _minimap is None:
+        return
+    cls = type(_minimap)
+    if _size_hook_class is cls:
+        return
+    if _size_hook_class is not None:
+        remove_size_diagnostic_hook()
+    _size_hook_class = cls
+    for name in ('applyNewSize', '_processMinimapSize', 'as_setSizeS'):
+        original = getattr(cls, name, None)
+        if not callable(original):
+            log('METHOD HOOK unavailable %s' % name)
+            continue
+        # Preserve any existing patches (including centered minimap).
+        def make_wrapper(method_name, method):
+            def wrapper(self, *args, **kwargs):
+                result = method(self, *args, **kwargs)
+                if (method_name == 'as_setSizeS' and self is _minimap and
+                        not _internal_size_call and _size_watch_ready and args):
+                    try:
+                        now = BigWorld.time()
+                        size = float(args[0])
+                        index = int(round(size))
+                        if (now - _last_user_resize_key_time <= 0.8 and
+                                abs(size - index) < 0.001 and 0 <= index <= 5 and
+                                index != _battle_size):
+                            record_user_minimap_size(index)
+                    except Exception:
+                        _LOGGER.exception('Unable to capture actual minimap size')
+                return result
+            return wrapper
+        wrapped = make_wrapper(name, original)
+        try:
+            setattr(cls, name, wrapped)
+            _size_hook_originals[name] = original
+            _size_hook_wrappers[name] = wrapped
+            log('METHOD HOOK installed %s original=%r module=%r' %
+                (name, original, getattr(original, '__module__', None)))
+        except Exception as exc:
+            log('METHOD HOOK failed %s error=%r' % (name, exc))
+
+
+def remove_size_diagnostic_hook():
+    global _size_hook_class
+    cls = _size_hook_class
+    if cls is not None:
+        for name, original in _size_hook_originals.items():
+            try:
+                if getattr(cls, name, None) is _size_hook_wrappers.get(name):
+                    setattr(cls, name, original)
+            except Exception:
+                _LOGGER.exception('Unable to restore size method %s', name)
+    _size_hook_originals.clear()
+    _size_hook_wrappers.clear()
+    _size_hook_class = None
+
+
+_last_diagnostic_key_time = 0.0
+
+
+def _safe_method_probe(component, name):
+    if component is None:
+        return 'no component'
+    try:
+        method = getattr(component, name, None)
+        if not callable(method):
+            return 'not callable'
+        return repr(method())[:240]
+    except Exception as exc:
+        return 'error:%s' % (str(exc)[:160],)
+
+
+def _size_snapshot():
+    try:
+        component = _minimap
+        flash = get_flash()
+        info = get_display_info()
+        return ('getMinimapSize=%s pixels=%r display=%r '
+                'flash_as_setSize=%s component_as_setSizeS=%s '
+                'setting=%r saved=%r battle=%r' % (
+                    _safe_method_probe(component, '_getMinimapSize'),
+                    get_minimap_size_pixels(),
+                    None if info is None else (getattr(info, 'width', None), getattr(info, 'height', None)),
+                    bool(flash is not None and hasattr(flash, 'as_setSize')),
+                    bool(component is not None and hasattr(component, 'as_setSizeS')),
+                    read_minimap_size_from_settings(), _saved_size, _battle_size))
+    except Exception as exc:
+        return 'snapshot_error=%r' % (exc,)
+
+
+def _log_resize_diagnostic(key):
+    global _last_diagnostic_key_time
+    if key not in (getattr(Keys, 'KEY_EQUALS', -999), getattr(Keys, 'KEY_MINUS', -998),
+                   getattr(Keys, 'KEY_ADD', -997), getattr(Keys, 'KEY_SUBTRACT', -996)):
+        return
+    try:
+        now = BigWorld.time()
+        if now - _last_diagnostic_key_time < 0.12:
+            return
+        _last_diagnostic_key_time = now
+    except Exception:
+        pass
+    log('SIZE BEFORE key=%s %s' % (key, _size_snapshot()))
+    def after():
+        if _minimap is not None:
+            log('SIZE AFTER key=%s %s' % (key, _size_snapshot()))
+    BigWorld.callback(0.35, after)
+
+
 def set_minimap_display_size(index):
+    global _internal_size_call
+    install_size_diagnostic_hook()
     flash = get_flash()
     if flash is None:
         return False
     try:
         if hasattr(flash, 'as_setSize'):
-            flash.as_setSize(int(index))
+            _internal_size_call = True
+            try:
+                flash.as_setSize(int(index))
+            finally:
+                _internal_size_call = False
             return True
     except Exception:
         _LOGGER.exception('Unable to set minimap display size')
@@ -491,8 +631,9 @@ def freeze_battle_size():
 
     live = read_minimap_size_from_settings()
 
-    # If settings are stuck at default 2 but cfg has another size, trust cfg.
-    if _saved_size is not None and live == 2 and _saved_size != 2:
+    # The configuration is authoritative at battle startup.
+    # Later, the size watcher accepts deliberate in-battle changes.
+    if _saved_size is not None:
         _battle_size = int(_saved_size)
     else:
         _battle_size = int(live)
@@ -557,6 +698,27 @@ def refresh_minimap():
     )
 
 
+def cancel_size_watch():
+    global _size_watch_callback, _size_watch_ready
+    if _size_watch_callback is not None:
+        try:
+            BigWorld.cancelCallback(_size_watch_callback)
+        except Exception:
+            pass
+    _size_watch_callback = None
+    _size_watch_ready = False
+
+
+def watch_minimap_size():
+    # Size is captured by as_setSizeS on actual user resize input.
+    return
+
+
+def begin_size_watch():
+    global _size_watch_ready
+    _size_watch_ready = True
+
+
 # ===========================================================================
 # Callback management
 # ===========================================================================
@@ -607,10 +769,13 @@ def schedule_apply(delay, tag):
             % (tag, _base_x + _offset_x, _base_y + _offset_y)
         )
 
-        if tag == 'initial' and (
-            abs(_offset_x) > 0.5 or abs(_offset_y) > 0.5
-        ):
+        if tag == 'initial':
+            # Restore saved size even when the minimap was never moved.
             refresh_minimap()
+        elif tag == 'late':
+            # Wait until the initial refresh has completed before observing
+            # user changes, so our own size writes are not misidentified.
+            begin_size_watch()
 
     callback_id = BigWorld.callback(delay, callback)
     holder[0] = callback_id
@@ -738,9 +903,15 @@ def poll_mouse():
 # Keyboard
 # ===========================================================================
 
+
 def on_key_event(event):
+    global _last_user_resize_key_time
     try:
         key = event.key
+        if _minimap is not None and key in (
+                getattr(Keys, 'KEY_EQUALS', -999), getattr(Keys, 'KEY_MINUS', -998),
+                getattr(Keys, 'KEY_ADD', -997), getattr(Keys, 'KEY_SUBTRACT', -996)):
+            _last_user_resize_key_time = BigWorld.time()
         if key not in (
             Keys.KEY_LCONTROL,
             Keys.KEY_RCONTROL,
@@ -769,6 +940,7 @@ def on_key_event(event):
 def teardown_battle():
     global _minimap, _base_x, _base_y, _base_locked, _battle_size
     cancel_poll()
+    cancel_size_watch()
     cancel_refresh()
     cancel_apply_callbacks()
     reset_drag_state()
@@ -790,7 +962,8 @@ def _populate_wrapper(self):
         _base_locked = False
         _battle_size = None
         load_offset()
-        log('Minimap registered')
+        log('Minimap registered; size methods: _getMinimapSize=%r _processMinimapSize=%r applyNewSize=%r as_setSizeS=%r' % (getattr(self, '_getMinimapSize', None), getattr(self, '_processMinimapSize', None), getattr(self, 'applyNewSize', None), getattr(self, 'as_setSizeS', None)))
+        install_size_diagnostic_hook()
         # Freeze size before any refresh can call as_setSize.
         BigWorld.callback(0.15, freeze_battle_size)
         schedule_apply(0.25, 'initial')
@@ -800,6 +973,7 @@ def _populate_wrapper(self):
 
 
 def _dispose_wrapper(self):
+    # Do not overwrite the observed size with the stale settings value (2).
     try:
         teardown_battle()
     except Exception:
@@ -839,6 +1013,7 @@ def fini():
         return
 
     teardown_battle()
+    remove_size_diagnostic_hook()
 
     try:
         InputHandler.g_instance.onKeyDown -= on_key_event
